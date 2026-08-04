@@ -1,15 +1,15 @@
 {
     "water_region": {
-        "top": 351,
-        "left": 1107,
-        "width": 382,
-        "height": 263
+        "top": 311,
+        "left": 1117,
+        "width": 242,
+        "height": 209
     },
     "bar_region": {
-        "top": 427,
-        "left": 937,
-        "width": 628,
-        "height": 334
+        "top": 541,
+        "left": 836,
+        "width": 247,
+        "height": 58
     },
     "cast_power_time": 0.55,
     "hsv": {
@@ -25,13 +25,13 @@
         ],
         "lower_zone": [
             34,
-            127,
-            61
+            129,
+            59
         ],
         "upper_zone": [
             58,
-            247,
-            182
+            249,
+            179
         ]
     },
     "auto_hsv": {
