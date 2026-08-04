@@ -1,0 +1,1189 @@
+--- СТРУКТУРА ПРОЕКТА ---
+Albion-online-fishing-bot/
+    .gitignore
+    bot_worker.py
+    config.json
+    config.py
+    gui_main.py
+    input_handler.py
+    main.py
+    project_content.txt
+    README.md
+    region_selector.py
+    repo_to_text.py
+    test_bar.py
+    vision.py
+    templates/
+        fish_icon.png
+        README.md
+
+==================================================
+
+--- FILE START: bot_worker.py ---
+import time
+import cv2
+import numpy as np
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from vision import Vision
+from input_handler import InputHandler
+
+
+class BotWorker(QThread):
+    water_frame_ready = pyqtSignal(np.ndarray)
+    bar_frame_ready = pyqtSignal(np.ndarray)
+    mask_float_ready = pyqtSignal(np.ndarray)
+    mask_zone_ready = pyqtSignal(np.ndarray)
+    log_ready = pyqtSignal(str)
+    status_changed = pyqtSignal(str)
+
+    STATE_PAUSED = -1
+    STATE_CASTING = 0
+    STATE_FISHING = 1
+    STATE_MINIGAME = 2
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.vision = Vision()
+        self.running = True
+        self.current_state = self.STATE_PAUSED
+
+    def toggle_active(self):
+        if self.current_state == self.STATE_PAUSED:
+            self.current_state = self.STATE_CASTING
+            self.status_changed.emit("АКТИВЕН (Заброс)")
+            self.log_ready.emit("[⚡ СТАРТ] Бот запущен!")
+        else:
+            self.current_state = self.STATE_PAUSED
+            InputHandler.hold_mouse_end()
+            self.status_changed.emit("ПАУЗА")
+            self.log_ready.emit("[💤 ПАУЗА] Бот остановлен!")
+
+    def run(self):
+        is_float_tracked = False
+        lost_frames_counter = 0
+        REQUIRED_LOST_FRAMES = 3
+        minigame_lost_frames = 0
+
+        # Счетчик кадров для пропусков обновления UI (разгрузка Qt)
+        ui_frame_counter = 0
+        current_lmb_state = False  # Отслеживание состояния мыши
+
+        while self.running:
+            water_region = self.config["water_region"]
+            bar_region = self.config["bar_region"]
+            cast_power_time = self.config.get("cast_power_time", 0.55)
+            hsv_cfg = self.config["hsv"]
+
+            lower_float = np.array(hsv_cfg["lower_float"])
+            upper_float = np.array(hsv_cfg["upper_float"])
+            lower_zone = np.array(hsv_cfg["lower_zone"])
+            upper_zone = np.array(hsv_cfg["upper_zone"])
+
+            water_center_x = water_region["left"] + water_region["width"] // 2
+            water_center_y = water_region["top"] + water_region["height"] // 2
+
+            ui_frame_counter += 1
+            should_update_ui = (ui_frame_counter % 3 == 0)  # Обновляем UI только каждый 3-й кадр
+
+            # === СОСТОЯНИЕ: ПАУЗА ===
+            if self.current_state == self.STATE_PAUSED:
+                if should_update_ui:
+                    water_frame = self.vision.capture_screen(water_region)
+                    bar_frame = self.vision.capture_screen(bar_region)
+
+                    hsv_water = cv2.cvtColor(water_frame, cv2.COLOR_BGR2HSV)
+                    mask_float = cv2.inRange(hsv_water, lower_float, upper_float)
+
+                    hsv_bar = cv2.cvtColor(bar_frame, cv2.COLOR_BGR2HSV)
+                    mask_zone = cv2.inRange(hsv_bar, lower_zone, upper_zone)
+
+                    self.mask_float_ready.emit(mask_float)
+                    self.mask_zone_ready.emit(mask_zone)
+
+                    cv2.putText(water_frame, "PAUSED", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.putText(bar_frame, "PAUSED", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                    self.water_frame_ready.emit(water_frame)
+                    self.bar_frame_ready.emit(bar_frame)
+
+                self.msleep(80)
+                continue
+
+            # === СОСТОЯНИЕ 0: АВТО-ЗАБРОС УДОЧКИ ===
+            elif self.current_state == self.STATE_CASTING:
+                self.log_ready.emit("[ACTION] Замахиваемся и закидываем удочку...")
+                InputHandler.hold_mouse_start(water_center_x, water_center_y)
+                current_lmb_state = True
+                time.sleep(cast_power_time)
+                InputHandler.hold_mouse_end()
+                current_lmb_state = False
+
+                self.log_ready.emit("[ACTION] Ожидаем падения поплавка...")
+                time.sleep(2.2)
+
+                is_float_tracked = False
+                lost_frames_counter = 0
+                self.current_state = self.STATE_FISHING
+                self.status_changed.emit("СЛЕЖКА ЗА ПОПЛАВКОМ")
+
+            # === СОСТОЯНИЕ 1: СЛЕЖКА ЗА ПОПЛАВКОМ ===
+            elif self.current_state == self.STATE_FISHING:
+                water_frame = self.vision.capture_screen(water_region)
+                center, bbox = self.vision.find_color_object(water_frame, lower_float, upper_float, is_float=True)
+
+                if center and bbox:
+                    lost_frames_counter = 0
+                    if not is_float_tracked:
+                        self.log_ready.emit("[FISHING] Поплавок найден, следим...")
+                    is_float_tracked = True
+
+                    if should_update_ui:
+                        x, y, w, h = bbox
+                        cv2.rectangle(water_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.circle(water_frame, center, 4, (0, 0, 255), -1)
+                else:
+                    if is_float_tracked:
+                        lost_frames_counter += 1
+                        if lost_frames_counter >= REQUIRED_LOST_FRAMES:
+                            self.log_ready.emit("[🔥 TRIGGER] ПОКЛЕВКА! Подсекаем!")
+                            InputHandler.click_mouse(water_center_x, water_center_y)
+                            time.sleep(1.1)
+
+                            is_float_tracked = False
+                            lost_frames_counter = 0
+                            minigame_lost_frames = 0
+                            self.current_state = self.STATE_MINIGAME
+                            self.status_changed.emit("МИНИ-ИГРА")
+
+                if should_update_ui:
+                    hsv_water = cv2.cvtColor(water_frame, cv2.COLOR_BGR2HSV)
+                    mask_float = cv2.inRange(hsv_water, lower_float, upper_float)
+                    self.mask_float_ready.emit(mask_float)
+
+                    cv2.putText(water_frame, "FISHING...", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    self.water_frame_ready.emit(water_frame)
+
+                self.msleep(5)  # Минимальная пауза для работы потока
+
+            # === СОСТОЯНИЕ 2: МИНИ-ИГРА (МОЛНИЕНОСНАЯ РЕАКЦИЯ) ===
+            elif self.current_state == self.STATE_MINIGAME:
+                bar_frame = self.vision.capture_screen(bar_region)
+                hsv_bar = cv2.cvtColor(bar_frame, cv2.COLOR_BGR2HSV)
+                mask_zone = cv2.inRange(hsv_bar, lower_zone, upper_zone)
+
+                if cv2.countNonZero(mask_zone) > 200:
+                    minigame_lost_frames = 0
+
+                    contours_zone, _ = cv2.findContours(mask_zone, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    zone_x = None
+                    if contours_zone:
+                        largest_zone = max(contours_zone, key=cv2.contourArea)
+                        zx, zy, zw, zh = cv2.boundingRect(largest_zone)
+                        zone_x = zx + zw // 2
+
+                    mask_inv = cv2.bitwise_not(mask_zone)
+                    contours_inv, _ = cv2.findContours(mask_inv, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+                    float_x = None
+                    for cnt in contours_inv:
+                        area = cv2.contourArea(cnt)
+                        if 10 < area < 300:
+                            fx, fy, fw, fh = cv2.boundingRect(cnt)
+                            if 5 < fy < bar_region["height"] - 5:
+                                float_x = fx + fw // 2
+                                break
+
+                    # Мгновенное принятие решения БЕЗ sleep()
+                    if float_x is not None and zone_x is not None:
+                        if float_x < zone_x:
+                            if not current_lmb_state:
+                                InputHandler.hold_mouse_start()
+                                current_lmb_state = True
+                        else:
+                            if current_lmb_state:
+                                InputHandler.hold_mouse_end()
+                                current_lmb_state = False
+                    else:
+                        if current_lmb_state:
+                            InputHandler.hold_mouse_end()
+                            current_lmb_state = False
+                else:
+                    minigame_lost_frames += 1
+                    if minigame_lost_frames >= 80:
+                        self.log_ready.emit("[✔ SYSTEM] Рыба вытащена!")
+                        if current_lmb_state:
+                            InputHandler.hold_mouse_end()
+                            current_lmb_state = False
+
+                        time.sleep(2.0)
+                        self.current_state = self.STATE_CASTING
+                        self.status_changed.emit("ЗАБРОС")
+
+                if should_update_ui:
+                    self.mask_zone_ready.emit(mask_zone)
+                    cv2.putText(bar_frame, "MINIGAME...", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    self.bar_frame_ready.emit(bar_frame)
+
+                self.msleep(2)  # Максимальная скорость работы мини-игры (~500 FPS)
+
+    def stop(self):
+        self.running = False
+        InputHandler.hold_mouse_end()
+        self.wait()
+--- FILE END: bot_worker.py ---
+
+--- FILE START: config.json ---
+{
+    "water_region": {
+        "top": 105,
+        "left": 468,
+        "width": 420,
+        "height": 442
+    },
+    "bar_region": {
+        "top": 572,
+        "left": 832,
+        "width": 268,
+        "height": 116
+    },
+    "cast_power_time": 0.55,
+    "hsv": {
+        "lower_float": [
+            45,
+            166,
+            0
+        ],
+        "upper_float": [
+            179,
+            255,
+            255
+        ],
+        "lower_zone": [
+            43,
+            100,
+            100
+        ],
+        "upper_zone": [
+            85,
+            255,
+            255
+        ]
+    }
+}
+--- FILE END: config.json ---
+
+--- FILE START: config.py ---
+import json
+import os
+
+CONFIG_FILE = "config.json"
+
+DEFAULT_CONFIG = {
+    "water_region": {"top": 220, "left": 500, "width": 900, "height": 400},
+    "bar_region": {"top": 450, "left": 710, "width": 500, "height": 180},
+    "cast_power_time": 0.55,
+    "hsv": {
+        "lower_float": [0, 100, 100],
+        "upper_float": [10, 255, 255],
+        "lower_zone": [35, 100, 100],
+        "upper_zone": [85, 255, 255]
+    }
+}
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return DEFAULT_CONFIG
+
+def save_config(config_data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config_data, f, indent=4)
+--- FILE END: config.py ---
+
+--- FILE START: gui_main.py ---
+import sys
+import cv2
+import numpy as np
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QSlider,
+                             QTextEdit, QTabWidget, QGroupBox, QFormLayout, QSpinBox)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
+import qdarktheme
+
+from config import load_config, save_config
+from region_selector import RegionSelector
+from bot_worker import BotWorker
+
+class BotGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.config = load_config()
+        self.is_overlay = False
+
+        # ЗАКРЕПЛЯЕМ ОКНО ПОВЕРХ ВСЕХ ОКОН ПРИ ЗАПУСКЕ!
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
+
+        self.setWindowTitle("Albion Fishing Bot")
+        self.resize(520, 940)
+
+        self.init_ui()
+
+        # Поток бота
+        self.worker = BotWorker(self.config)
+        self.worker.water_frame_ready.connect(self.update_water_viewport)
+        self.worker.bar_frame_ready.connect(self.update_bar_viewport)
+        self.worker.mask_float_ready.connect(self.update_mask_float)
+        self.worker.mask_zone_ready.connect(self.update_mask_zone)
+        self.worker.log_ready.connect(self.log)
+        self.worker.status_changed.connect(self.update_status)
+        self.worker.start()
+
+        # Хоткеи
+        self.shortcut_f1 = QShortcut(QKeySequence("F1"), self)
+        self.shortcut_f1.activated.connect(self.worker.toggle_active)
+
+        self.shortcut_overlay = QShortcut(QKeySequence("Shift+Tab"), self)
+        self.shortcut_overlay.activated.connect(self.toggle_overlay_mode)
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+
+        # ---------------------------------------------------------------------
+        # ДВОЙНОЙ ВИДОИСКАТЕЛЬ
+        # ---------------------------------------------------------------------
+        viewports_layout = QHBoxLayout()
+
+        box_water = QVBoxLayout()
+        box_water.addWidget(QLabel("🌊 Зона Воды"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.viewport_water = QLabel("Загрузка...")
+        self.viewport_water.setFixedSize(240, 160)
+        self.viewport_water.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewport_water.setStyleSheet("border: 2px solid #2e7d32; background: #000; border-radius: 4px;")
+        box_water.addWidget(self.viewport_water)
+
+        box_bar = QVBoxLayout()
+        box_bar.addWidget(QLabel("📊 Зона Шкалы"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.viewport_bar = QLabel("Загрузка...")
+        self.viewport_bar.setFixedSize(240, 160)
+        self.viewport_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewport_bar.setStyleSheet("border: 2px solid #0288d1; background: #000; border-radius: 4px;")
+        box_bar.addWidget(self.viewport_bar)
+
+        viewports_layout.addLayout(box_water)
+        viewports_layout.addLayout(box_bar)
+        main_layout.addLayout(viewports_layout)
+
+        # ---------------------------------------------------------------------
+        # ВКЛАДКИ
+        # ---------------------------------------------------------------------
+        tabs = QTabWidget()
+
+        # --- ВКЛАДКА 1: Управление ---
+        tab_control = QWidget()
+        control_layout = QVBoxLayout(tab_control)
+
+        self.lbl_status = QLabel("СТАТУС: ПАУЗА")
+        self.lbl_status.setStyleSheet("font-size: 15px; font-weight: bold; color: #ff5252;")
+        control_layout.addWidget(self.lbl_status)
+
+        self.btn_start = QPushButton("▶ СТАРТ / ПАУЗА (F1)")
+        self.btn_start.setFixedHeight(38)
+        self.btn_start.setStyleSheet("background-color: #2e7d32; font-weight: bold; font-size: 13px;")
+        self.btn_start.clicked.connect(lambda: self.worker.toggle_active())
+        control_layout.addWidget(self.btn_start)
+
+        self.btn_overlay = QPushButton("👁️ Оверлей (Shift+Tab)")
+        self.btn_overlay.clicked.connect(self.toggle_overlay_mode)
+        control_layout.addWidget(self.btn_overlay)
+
+        group_regions = QGroupBox("Выделение мышкой")
+        reg_layout = QHBoxLayout(group_regions)
+
+        btn_select_water = QPushButton("🌊 Зона ВОДЫ")
+        btn_select_water.clicked.connect(lambda: self.start_region_select("water_region"))
+        reg_layout.addWidget(btn_select_water)
+
+        btn_select_bar = QPushButton("📊 Зона ШКАЛЫ")
+        btn_select_bar.clicked.connect(lambda: self.start_region_select("bar_region"))
+        reg_layout.addWidget(btn_select_bar)
+
+        control_layout.addWidget(group_regions)
+
+        group_bar_manual = QGroupBox("Точная настройка ШКАЛЫ (пиксели)")
+        bar_form = QFormLayout(group_bar_manual)
+
+        bar_cfg = self.config["bar_region"]
+
+        self.spin_bar_left = QSpinBox()
+        self.spin_bar_left.setRange(0, 3840)
+        self.spin_bar_left.setValue(bar_cfg["left"])
+        self.spin_bar_left.valueChanged.connect(self.update_manual_bar_region)
+
+        self.spin_bar_top = QSpinBox()
+        self.spin_bar_top.setRange(0, 2160)
+        self.spin_bar_top.setValue(bar_cfg["top"])
+        self.spin_bar_top.valueChanged.connect(self.update_manual_bar_region)
+
+        self.spin_bar_width = QSpinBox()
+        self.spin_bar_width.setRange(10, 2000)
+        self.spin_bar_width.setValue(bar_cfg["width"])
+        self.spin_bar_width.valueChanged.connect(self.update_manual_bar_region)
+
+        self.spin_bar_height = QSpinBox()
+        self.spin_bar_height.setRange(10, 2000)
+        self.spin_bar_height.setValue(bar_cfg["height"])
+        self.spin_bar_height.valueChanged.connect(self.update_manual_bar_region)
+
+        bar_form.addRow("X (Left):", self.spin_bar_left)
+        bar_form.addRow("Y (Top):", self.spin_bar_top)
+        bar_form.addRow("Ширина (Width):", self.spin_bar_width)
+        bar_form.addRow("Высота (Height):", self.spin_bar_height)
+
+        control_layout.addWidget(group_bar_manual)
+        control_layout.addStretch()
+        tabs.addTab(tab_control, "Управление")
+
+        # --- ВКЛАДКА 2: ДВОЙНАЯ HSV КАЛИБРОВКА ---
+        tab_hsv_main = QWidget()
+        hsv_main_layout = QVBoxLayout(tab_hsv_main)
+
+        hsv_sub_tabs = QTabWidget()
+
+        # Под-вкладка 1: Поплавок
+        sub_float = QWidget()
+        layout_float = QVBoxLayout(sub_float)
+        self.mask_float_view = QLabel("Маска поплавка")
+        self.mask_float_view.setFixedSize(220, 110)
+        self.mask_float_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mask_float_view.setStyleSheet("border: 1px solid #ff5252; background: #000;")
+        layout_float.addWidget(self.mask_float_view, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        form_float = QFormLayout()
+        self.s_fh_min = self.create_slider(0, 179, self.config["hsv"]["lower_float"][0], self.update_hsv_float)
+        self.s_fs_min = self.create_slider(0, 255, self.config["hsv"]["lower_float"][1], self.update_hsv_float)
+        self.s_fv_min = self.create_slider(0, 255, self.config["hsv"]["lower_float"][2], self.update_hsv_float)
+        self.s_fh_max = self.create_slider(0, 179, self.config["hsv"]["upper_float"][0], self.update_hsv_float)
+        self.s_fs_max = self.create_slider(0, 255, self.config["hsv"]["upper_float"][1], self.update_hsv_float)
+        self.s_fv_max = self.create_slider(0, 255, self.config["hsv"]["upper_float"][2], self.update_hsv_float)
+
+        form_float.addRow("H Min:", self.s_fh_min)
+        form_float.addRow("S Min:", self.s_fs_min)
+        form_float.addRow("V Min:", self.s_fv_min)
+        form_float.addRow("H Max:", self.s_fh_max)
+        form_float.addRow("S Max:", self.s_fs_max)
+        form_float.addRow("V Max:", self.s_fv_max)
+        layout_float.addLayout(form_float)
+        hsv_sub_tabs.addTab(sub_float, "🔴 Поплавок")
+
+        # Под-вкладка 2: Зеленая Шкала
+        sub_zone = QWidget()
+        layout_zone = QVBoxLayout(sub_zone)
+        self.mask_zone_view = QLabel("Маска шкалы")
+        self.mask_zone_view.setFixedSize(220, 110)
+        self.mask_zone_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mask_zone_view.setStyleSheet("border: 1px solid #69f0ae; background: #000;")
+        layout_zone.addWidget(self.mask_zone_view, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        form_zone = QFormLayout()
+        self.s_zh_min = self.create_slider(0, 179, self.config["hsv"]["lower_zone"][0], self.update_hsv_zone)
+        self.s_zs_min = self.create_slider(0, 255, self.config["hsv"]["lower_zone"][1], self.update_hsv_zone)
+        self.s_zv_min = self.create_slider(0, 255, self.config["hsv"]["lower_zone"][2], self.update_hsv_zone)
+        self.s_zh_max = self.create_slider(0, 179, self.config["hsv"]["upper_zone"][0], self.update_hsv_zone)
+        self.s_zs_max = self.create_slider(0, 255, self.config["hsv"]["upper_zone"][1], self.update_hsv_zone)
+        self.s_zv_max = self.create_slider(0, 255, self.config["hsv"]["upper_zone"][2], self.update_hsv_zone)
+
+        form_zone.addRow("H Min:", self.s_zh_min)
+        form_zone.addRow("S Min:", self.s_zs_min)
+        form_zone.addRow("V Min:", self.s_zv_min)
+        form_zone.addRow("H Max:", self.s_zh_max)
+        form_zone.addRow("S Max:", self.s_zs_max)
+        form_zone.addRow("V Max:", self.s_zv_max)
+        layout_zone.addLayout(form_zone)
+        hsv_sub_tabs.addTab(sub_zone, "🟢 Зеленая Шкала")
+
+        hsv_main_layout.addWidget(hsv_sub_tabs)
+        tabs.addTab(tab_hsv_main, "HSV Калибровка")
+
+        main_layout.addWidget(tabs)
+
+        # ---------------------------------------------------------------------
+        # ЛОГИ
+        # ---------------------------------------------------------------------
+        self.log_output = QTextEdit()
+        self.log_output.setFixedHeight(160)
+        self.log_output.setReadOnly(True)
+        self.log_output.placeholderText = "Системные логи..."
+        main_layout.addWidget(self.log_output)
+
+    # --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ---
+    def create_slider(self, min_val, max_val, default_val, callback):
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default_val)
+        slider.valueChanged.connect(callback)
+        return slider
+
+    def update_manual_bar_region(self):
+        self.config["bar_region"] = {
+            "left": self.spin_bar_left.value(),
+            "top": self.spin_bar_top.value(),
+            "width": self.spin_bar_width.value(),
+            "height": self.spin_bar_height.value()
+        }
+        save_config(self.config)
+
+    def sync_spinboxes_with_config(self):
+        bar_cfg = self.config["bar_region"]
+        self.spin_bar_left.blockSignals(True)
+        self.spin_bar_top.blockSignals(True)
+        self.spin_bar_width.blockSignals(True)
+        self.spin_bar_height.blockSignals(True)
+
+        self.spin_bar_left.setValue(bar_cfg["left"])
+        self.spin_bar_top.setValue(bar_cfg["top"])
+        self.spin_bar_width.setValue(bar_cfg["width"])
+        self.spin_bar_height.setValue(bar_cfg["height"])
+
+        self.spin_bar_left.blockSignals(False)
+        self.spin_bar_top.blockSignals(False)
+        self.spin_bar_width.blockSignals(False)
+        self.spin_bar_height.blockSignals(False)
+
+    def update_hsv_float(self):
+        self.config["hsv"]["lower_float"] = [self.s_fh_min.value(), self.s_fs_min.value(), self.s_fv_min.value()]
+        self.config["hsv"]["upper_float"] = [self.s_fh_max.value(), self.s_fs_max.value(), self.s_fv_max.value()]
+        save_config(self.config)
+
+    def update_hsv_zone(self):
+        self.config["hsv"]["lower_zone"] = [self.s_zh_min.value(), self.s_zs_min.value(), self.s_zv_min.value()]
+        self.config["hsv"]["upper_zone"] = [self.s_zh_max.value(), self.s_zs_max.value(), self.s_zv_max.value()]
+        save_config(self.config)
+
+    def update_status(self, text):
+        self.lbl_status.setText(f"СТАТУС: {text}")
+        if any(w in text for w in ["АКТИВЕН", "СЛЕЖКА", "МИНИ-ИГРА"]):
+            self.lbl_status.setStyleSheet("font-size: 15px; font-weight: bold; color: #69f0ae;")
+        else:
+            self.lbl_status.setStyleSheet("font-size: 15px; font-weight: bold; color: #ff5252;")
+
+    def log(self, text):
+        self.log_output.append(text)
+
+    # --- ОБНОВЛЕНИЕ ТРАНСЛЯЦИЙ И МАСОК ---
+    def update_water_viewport(self, frame):
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        qt_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
+        self.viewport_water.setPixmap(QPixmap.fromImage(qt_img).scaled(
+            self.viewport_water.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def update_bar_viewport(self, frame):
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        qt_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
+        self.viewport_bar.setPixmap(QPixmap.fromImage(qt_img).scaled(
+            self.viewport_bar.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def update_mask_float(self, mask):
+        h, w = mask.shape
+        qt_img = QImage(mask.data, w, h, w, QImage.Format.Format_Grayscale8)
+        self.mask_float_view.setPixmap(QPixmap.fromImage(qt_img).scaled(
+            self.mask_float_view.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def update_mask_zone(self, mask):
+        h, w = mask.shape
+        qt_img = QImage(mask.data, w, h, w, QImage.Format.Format_Grayscale8)
+        self.mask_zone_view.setPixmap(QPixmap.fromImage(qt_img).scaled(
+            self.mask_zone_view.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def toggle_overlay_mode(self):
+        self.is_overlay = not self.is_overlay
+        if self.is_overlay:
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+            self.setWindowOpacity(0.75)
+            self.log("[UI] Режим Оверлея включен")
+        else:
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+            self.setWindowOpacity(1.0)
+            self.log("[UI] Обычный режим окна (поверх всех)")
+        self.show()
+
+    def start_region_select(self, region_key):
+        self.hide()
+        self.selector = RegionSelector()
+        self.selector.region_selected.connect(lambda rect: self.finish_region_select(region_key, rect))
+        self.selector.selection_cancelled.connect(self.cancel_region_select)
+        self.selector.show()
+
+    def finish_region_select(self, region_key, rect):
+        self.config[region_key] = rect
+        save_config(self.config)
+        self.sync_spinboxes_with_config()
+        self.log(f"[CONFIG] Зона '{region_key}' сохранена: {rect}")
+        self.show()
+
+    def cancel_region_select(self):
+        self.show()
+
+    def closeEvent(self, event):
+        if hasattr(self, 'worker'):
+            self.worker.stop()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    try:
+        qdarktheme.setup_theme()
+    except AttributeError:
+        app.setStyleSheet(qdarktheme.load_stylesheet())
+
+    gui = BotGUI()
+    gui.show()
+    sys.exit(app.exec())
+--- FILE END: gui_main.py ---
+
+--- FILE START: input_handler.py ---
+import ctypes
+import time
+
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+
+class InputHandler:
+    @staticmethod
+    def move_cursor(x, y):
+        """Аппаратное перемещение курсора мыши в физические координаты экрана."""
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
+
+    @staticmethod
+    def click_mouse(x=None, y=None, delay=0.1):
+        """
+        Делает физический клик ЛКМ. 
+        Если переданы x и y — курсор автоматически перемещается в эту точку перед кликом.
+        """
+        if x is not None and y is not None:
+            InputHandler.move_cursor(x, y)
+            time.sleep(0.05)
+
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(delay)
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    @staticmethod
+    def hold_mouse_start(x=None, y=None):
+        if x is not None and y is not None:
+            InputHandler.move_cursor(x, y)
+            time.sleep(0.05)
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+
+    @staticmethod
+    def hold_mouse_end():
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+--- FILE END: input_handler.py ---
+
+--- FILE START: main.py ---
+import cv2
+import numpy as np
+import time
+import keyboard  # Импортируем библиотеку для глобальных хоткеев
+from vision import Vision
+from input_handler import InputHandler
+
+def main():
+    vision = Vision()
+    
+    # 1. Наша проверенная геометрия регионов
+    water_region = {"top": 220, "left": 500, "width": 900, "height": 400}
+    bar_region = {"top": 450, "left": 710, "width": 500, "height": 180}
+    
+    # =========================================================================
+    # ⚙️ ТВОЯ НАСТРОЙКА ДАЛЬНОСТИ ЗАБРОСА УДОЧКИ (РЕГУЛИРУЙ ЗДЕСЬ!)
+    # =========================================================================
+    CAST_POWER_TIME = 0.55  # Время зажатия ЛКМ в секундах. 
+                            # 0.3 - под ноги, 0.55 - средний, 0.9 - дальний.
+    # =========================================================================
+    
+    # Имена окон для жесткого закрепления поверх игры (Always on Top)
+    window_main = "Bot Active Viewport"
+    window_zone = "DEBUG ZONE MASK"
+    window_float = "INVERSE FLOAT TARGET" 
+    window_water_debug = "DEBUG MASK (Water)"
+    
+    cv2.namedWindow(window_main)
+    cv2.setWindowProperty(window_main, cv2.WND_PROP_TOPMOST, 1)
+    
+    # 2. ПОЛНОСТЬЮ ЗАПОЛНЕННЫЕ НАСТРОЙКИ HSV (Ошибок больше не будет!)
+    lower_float = np.array([0, 100, 100])
+    upper_float = np.array([10, 255, 255])
+    
+    lower_dark_float = np.array([0, 185, 100])
+    upper_dark_float = np.array([10, 255, 255])
+    
+    lower_fish = np.array([0, 220, 200])
+    upper_fish = np.array([10, 255, 255])
+    
+    lower_zone = np.array([35, 100, 100])
+    upper_zone = np.array([85, 255, 255])
+
+    # СТАТУСЫ НАШЕЙ СИСТЕМЫ:
+    STATE_PAUSED = -1    # Бот спит и ничего не делает
+    STATE_CASTING = 0    # Шаг 1: Авто-заброс удочки
+    STATE_FISHING = 1    # Шаг 2: Слежка за поплавком в воде
+    STATE_MINIGAME = 2   # Шаг 3: Авто-мини-игра
+    
+    # СТАРТУЕМ В РЕЖИМЕ ПАУЗЫ (ЖДЕМ НАЖАТИЯ F1)
+    current_state = STATE_PAUSED
+    bot_active = False
+
+    is_float_tracked = False
+    lost_frames_counter = 0
+    REQUIRED_LOST_FRAMES = 3   # Молниеносная подсечка дня за 3 кадра
+    minigame_lost_frames = 0   
+
+    print("[SYSTEM] ПОЛНАЯ АВТОМАТИКА С КНОПКОЙ ПАУЗЫ ЗАПУЩЕНА!")
+    print("[SYSTEM] Нажмите клавишу F1 в игре, чтобы запустить или остановить цикл.")
+
+    while True:
+        # ОБРАБОТКА ХОТКЕЯ F1 НА ХОДУ
+        if keyboard.is_pressed('f1'):
+            bot_active = not bot_active
+            time.sleep(0.3)  # Защита от дребезга контактов клавиатуры
+            
+            if bot_active:
+                print("\n[⚡ СТАРТ] Бот активирован! Начинаем цикл рыбалки...")
+                current_state = STATE_CASTING
+            else:
+                print("\n[💤 ПАУЗА] Бот остановлен! Мышь освобождена.")
+                InputHandler.hold_mouse_end()  # Принудительно отпускаем ЛКМ при паузе
+                current_state = STATE_PAUSED
+                
+                # Мгновенно закрываем дебаг-окна, чтобы они не мешали играть руками
+                try:
+                    cv2.destroyWindow(window_zone)
+                    cv2.destroyWindow(window_float)
+                    cv2.destroyWindow(window_water_debug)
+                except: pass
+
+        # === РЕЖИМ: БОТ НА ПАУЗЕ ===
+        if current_state == STATE_PAUSED:
+            frame = vision.capture_screen(water_region)
+            cv2.putText(frame, "BOT PAUSED - Press F1 to Start", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.imshow(window_main, frame)
+            cv2.waitKey(1)
+            continue
+
+        # === РЕЖИМ 0: АВТОМАТИЧЕСКИЙ ЗАБРОС УДОЧКИ ===
+        elif current_state == STATE_CASTING:
+            print("\n[ACTION] Замахиваемся и закидываем удочку...")
+            
+            InputHandler.hold_mouse_start()
+            time.sleep(CAST_POWER_TIME)
+            InputHandler.hold_mouse_end()
+            
+            print(f"[ACTION] Заброс выполнен. Ожидаем падения поплавка...")
+            time.sleep(2.5)  
+            
+            is_float_tracked = False
+            lost_frames_counter = 0
+            current_state = STATE_FISHING
+
+        # === РЕЖИМ 1: СЛЕДИМ ЗА ПОПЛАВКОМ НА ВОДЕ ===
+        elif current_state == STATE_FISHING:
+            frame = vision.capture_screen(water_region)
+            
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask1 = cv2.inRange(hsv, lower_float, upper_float)
+            mask2 = cv2.inRange(hsv, lower_dark_float, upper_dark_float)
+            debug_mask = cv2.bitwise_or(mask1, mask2)
+            
+            cv2.namedWindow(window_water_debug)
+            cv2.setWindowProperty(window_water_debug, cv2.WND_PROP_TOPMOST, 1)
+            cv2.imshow(window_water_debug, debug_mask)
+
+            center, bbox = vision.find_color_object(frame, lower_float, upper_float, is_float=True)
+            
+            if center and bbox:
+                lost_frames_counter = 0
+                is_float_tracked = True
+                
+                x, y, w, h = bbox
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.circle(frame, center, 4, (0, 0, 255), -1)
+                print(f"[FISHING] Слежка... Поплавок стабилен.            ", end="\r")
+            else:
+                if is_float_tracked:
+                    lost_frames_counter += 1
+                    print(f"[WARN] Потеря кадра! Под водой: {lost_frames_counter}/{REQUIRED_LOST_FRAMES}  ", end="\r")
+                    
+                    if lost_frames_counter >= REQUIRED_LOST_FRAMES:
+                        print("\n[🔥 TRIGGER] ПОКЛЕВКА! Подсекаем рыбу!")
+                        InputHandler.click_mouse() 
+                        
+                        try: cv2.destroyWindow(window_water_debug)
+                        except: pass
+                        
+                        is_float_tracked = False
+                        lost_frames_counter = 0
+                        minigame_lost_frames = 0
+                        current_state = STATE_MINIGAME
+                else:
+                    print("[LOG] Поплавок еще летит или ищется на воде...  ", end="\r")
+            
+            cv2.imshow(window_main, frame)
+
+        # === РЕЖИМ 2: АВТОМАТИЧЕСКАЯ МИНИ-ИГРА ===
+        elif current_state == STATE_MINIGAME:
+            bar_frame = vision.capture_screen(bar_region)
+            hsv_bar = cv2.cvtColor(bar_frame, cv2.COLOR_BGR2HSV)
+            
+            mask_zone = cv2.inRange(hsv_bar, lower_zone, upper_zone)
+            cv2.namedWindow(window_zone)
+            cv2.setWindowProperty(window_zone, cv2.WND_PROP_TOPMOST, 1)
+            cv2.imshow(window_zone, mask_zone)
+            
+            if cv2.countNonZero(mask_zone) > 1000:
+                minigame_lost_frames = 0
+                mask_inv = cv2.bitwise_not(mask_zone)
+                
+                cv2.namedWindow(window_float)
+                cv2.setWindowProperty(window_float, cv2.WND_PROP_TOPMOST, 1)
+                cv2.imshow(window_float, mask_inv)
+                
+                contours_inv, _ = cv2.findContours(mask_inv, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                
+                float_x = None
+                for cnt in contours_inv:
+                    area = cv2.contourArea(cnt)
+                    if 15 < area < 200:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        if 10 < y < 150:
+                            float_x = x + w // 2
+                            break
+                
+                if float_x is not None:
+                    SCREEN_CENTER_X = 250  
+                    cv2.line(bar_frame, (SCREEN_CENTER_X, 0), (SCREEN_CENTER_X, 180), (0, 255, 0), 2)
+                    cv2.circle(bar_frame, (float_x, 90), 6, (0, 0, 255), -1)
+                    
+                    if float_x < SCREEN_CENTER_X:
+                        print(f"[RELAIS] Поплавок ({float_x}) < Центра (250) -> ЗАЖАТИЕ ЛКМ...           ", end="\r")
+                        InputHandler.hold_mouse_start()
+                        time.sleep(0.005)
+                    else:
+                        print(f"[RELAIS] Поплавок ({float_x}) >= Центра (250) -> ОТПУСКАЕМ (ОТДЫХ 20мс)    ", end="\r")
+                        InputHandler.hold_mouse_end()
+                        time.sleep(0.020)
+                else:
+                    InputHandler.hold_mouse_end()
+            else:
+                minigame_lost_frames += 1
+                print(f"[WARN-MINIGAME] Ожидание закрытия шкалы: {minigame_lost_frames}/45          ", end="\r")
+                
+                if minigame_lost_frames >= 45:
+                    print("\n[✔ SYSTEM] Шкала исчезла. Рыба в сумке!")
+                    InputHandler.hold_mouse_end()
+                    
+                    try:
+                        cv2.destroyWindow(window_zone)
+                        cv2.destroyWindow(window_float)
+                    except: pass
+                    
+                    print("[SYSTEM] Перезапуск цикла через 3.5 секунды...")
+                    time.sleep(3.5) 
+                    current_state = STATE_CASTING 
+                
+            cv2.imshow(window_main, bar_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+--- FILE END: main.py ---
+
+--- FILE START: README.md ---
+# 🎣 Albion Online Fishing Bot (PoC)
+
+An advanced, undetectable computer vision-based automation tool for Albion Online, written in Python using OpenCV. 
+
+> **Disclaimer / Дисклеймер:** Данный проект создан исключительно в образовательных целях для изучения алгоритмов компьютерного зрения (Computer Vision), систем низкоуровневой эмуляции ввода (Ring 3 OS Input) и методов обхода систем защиты (EAC Device Detection). Разработчики не несут ответственности за использование софта на живых серверах.
+
+---
+
+## 🛠️ Архитектура и технологии (Tech Stack)
+
+Проект спроектирован по модульному принципу без внедрения в память процесса игры (External/Passive Approach), что делает его невидимым для сигнатурного анализа античитов:
+
+*   **Python 3.11+** — основная программная логика.
+*   **OpenCV (Open Source Computer Vision Library)** — обработка изображений, цветовая сегментация (HSV), поиск контуров и трекинг объектов.
+*   **MSS (Multiple Screen Shots)** — сверхбыстрый захват фреймбуфера экрана напрямую через WinAPI (60+ FPS).
+*   **Interception / WinAPI cTypes** — низкоуровневая эмуляция аппаратного ввода мыши для обхода поведенческих блокировок.
+
+---
+
+## 📂 Структура репозитория
+
+```text
+├── templates/            # Папка со скриншотами-образцами элементов интерфейса
+├── .gitignore            # Исключение мусора разработки (pycache, venv)
+├── input_handler.py      # Модуль обхода античита и эмуляции кликов (Driver/WinAPI)
+├── main.py               # Главный диспетчер (State Machine бота)
+├── README.md             # Документация проекта
+└── vision.py             # Компьютерное зрение (поиск поплавка и мини-игры)
+```
+
+---
+
+## 🚀 Текущий статус разработки (Roadmap)
+
+- [x] **Инициализация репозитория** и проектирование архитектуры.
+- [x] **Модуль Vision**: Реализация стабильного трекинга поплавка по HSV-маске.
+- [x] **Модуль Vision**: Реализация парсинга шкалы мини-игры рыбалки (удержание бегунка).
+- [x] **Модуль Input**: Написание обхода виртуального клика (EAC Bypass via Input Emulation).
+- [x] **Модуль Main**: Реализация Конечного Автомата (State Machine) для переключения режимов (Ожидание -> Заброс -> Поклёвка -> Мини-игра).
+- [ ] **Авто-рыбалка (Авто-заброс удочки)**: Необходимо пересмотреть весь код, логику, парсинг и визор заброса, чтобы ее сделать.
+- [ ] **Клиент**: необходим.
+---
+
+## 👥 Разработчики (Contributors)
+
+*   **McCerber7** — [GitHub Профиль](https://github.com)
+*   **Decoori** — [GitHub Профиль](https://github.com)
+
+--- FILE END: README.md ---
+
+--- FILE START: region_selector.py ---
+from PyQt6.QtWidgets import QWidget, QRubberBand
+from PyQt6.QtCore import Qt, QRect, QPoint, QSize, pyqtSignal
+
+
+class RegionSelector(QWidget):
+    region_selected = pyqtSignal(dict)
+    selection_cancelled = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setWindowState(Qt.WindowState.WindowFullScreen)
+        self.setWindowOpacity(0.35)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+        self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self.origin = QPoint()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.origin = event.pos()
+            self.rubber_band.setGeometry(QRect(self.origin, QSize()))
+            self.rubber_band.show()
+
+    def mouseMoveEvent(self, event):
+        if not self.origin.isNull() and self.rubber_band.isVisible():
+            self.rubber_band.setGeometry(QRect(self.origin, event.pos()).normalized())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.rubber_band.hide()
+            rect = QRect(self.origin, event.pos()).normalized()
+            self.close()
+
+            if rect.width() > 10 and rect.height() > 10:
+                # Получаем коэффициент масштабирования Windows (DPI Scale: 1.25, 1.5 и т.д.)
+                dpr = self.devicePixelRatio()
+
+                # Переводим логические координаты Qt в физические пиксели для mss
+                region = {
+                    "top": int(rect.top() * dpr),
+                    "left": int(rect.left() * dpr),
+                    "width": int(rect.width() * dpr),
+                    "height": int(rect.height() * dpr)
+                }
+                self.region_selected.emit(region)
+            else:
+                self.selection_cancelled.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            self.selection_cancelled.emit()
+--- FILE END: region_selector.py ---
+
+--- FILE START: test_bar.py ---
+import cv2
+import numpy as np
+import time
+from vision import Vision
+from input_handler import InputHandler
+
+def main():
+    vision = Vision()
+    
+    # 1. Безопасный регион захвата воды (Отрезали нижний интерфейс и скиллы)
+    water_region = {"top": 100, "left": 500, "width": 900, "height": 450}
+    # Регион для шкалы мини-игры (центр экрана)
+    bar_region = {"top": 350, "left": 750, "width": 450, "height": 300}
+    
+    # 2. Твои стабильные ручные настройки HSV для поплавка
+    lower_float = np.array([0, 185, 100])
+    upper_float = np.array([10, 255, 255])
+    
+    # Твои идеальные настройки для элементов мини-игры
+    lower_fish = np.array([90, 0, 200])
+    upper_fish = np.array([130, 90, 255])
+    
+    lower_zone = np.array([35, 80, 80])
+    upper_zone = np.array([85, 255, 255])
+
+    STATE_FISHING = 0
+    STATE_MINIGAME = 1
+    current_state = STATE_FISHING
+
+    is_float_tracked = False
+    lost_frames_counter = 0
+    REQUIRED_LOST_FRAMES = 15  # Защита от ложных срабатываний мерцания воды
+
+    print("[SYSTEM] Бот запущен со стабильными HSV-параметрами. Ожидание заброса...")
+
+    while True:
+        # === РЕЖИМ 1: СЛЕДИМ ЗА ПОПЛАВКОМ НА ВОДЕ ===
+        if current_state == STATE_FISHING:
+            frame = vision.capture_screen(water_region)
+            
+            # Дебаг-маска воды
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            debug_mask = cv2.inRange(hsv, lower_float, upper_float)
+            cv2.imshow("DEBUG MASK (Must be Black before cast!)", debug_mask)
+
+            center, bbox = vision.find_color_object(frame, lower_float, upper_float)
+            
+            if center and bbox:
+                lost_frames_counter = 0
+                is_float_tracked = True  # Бот зафиксировал поплавок в воде
+                
+                x, y, w, h = bbox
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.circle(frame, center, 4, (0, 0, 255), -1)
+                print(f"[FISHING] Слежка... Поплавок стабилен.            ", end="\r")
+            else:
+                if is_float_tracked:
+                    lost_frames_counter += 1
+                    print(f"[WARN] Потеря кадра! Под водой: {lost_frames_counter}/{REQUIRED_LOST_FRAMES}  ", end="\r")
+                    
+                    if lost_frames_counter >= REQUIRED_LOST_FRAMES:
+                        print("\n[🔥 TRIGGER] ПОКЛЕВКА! Подсекаем и переходим в мини-игру!")
+                        InputHandler.click_mouse()
+                        
+                        is_float_tracked = False
+                        lost_frames_counter = 0
+                        current_state = STATE_MINIGAME
+                        time.sleep(1.5)  # Время на появление интерфейса шкалы
+                else:
+                    print("[LOG] Ожидание заброса (Вода должна быть чистой)...", end="\r")
+            
+            cv2.imshow("Bot Active Viewport", frame)
+
+        # === РЕЖИМ 2: АВТОМАТИЧЕСКАЯ МИНИ-ИГРА ===
+        elif current_state == STATE_MINIGAME:
+            bar_frame = vision.capture_screen(bar_region)
+            fish_center, _ = vision.find_color_object(bar_frame, lower_fish, upper_fish)
+            zone_center, _ = vision.find_color_object(bar_frame, lower_zone, upper_zone)
+            
+            if fish_center and zone_center:
+                fish_x = fish_center
+                zone_x = zone_center
+                
+                if fish_x < zone_x:
+                    print(f"[MINIGAME] Рыбка ({fish_x}) < Зоны ({zone_x}) -> ЗАЖИМАЕМ ЛКМ  ", end="\r")
+                    InputHandler.hold_mouse_start()
+                else:
+                    print(f"[MINIGAME] Рыбка ({fish_x}) > Зоны ({zone_x}) -> ОТПУСКАЕМ ЛКМ  ", end="\r")
+                    InputHandler.hold_mouse_end()
+            else:
+                print("\n[✔ SYSTEM] Шкала исчезла. Рыба поймана! Возврат в режим ожидания.")
+                InputHandler.hold_mouse_end()
+                is_float_tracked = False
+                lost_frames_counter = 0
+                current_state = STATE_FISHING
+                time.sleep(3.0)  # Пауза для скрытия уведомлений
+                
+            cv2.imshow("Bot Active Viewport", bar_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+--- FILE END: test_bar.py ---
+
+--- FILE START: vision.py ---
+import cv2
+import numpy as np
+import mss
+
+class Vision:
+    def __init__(self):
+        self.sct = mss.mss()
+        
+    def capture_screen(self, region):
+        screenshot = self.sct.grab(region)
+        img = np.array(screenshot)
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    def find_color_object(self, img, lower_color, upper_color, min_area=40, is_float=False):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        if is_float:
+            mask1 = cv2.inRange(hsv, lower_color, upper_color)
+            lower_dark_red = np.array([165, 50, 50]) 
+            upper_dark_red = np.array([179, 255, 255])
+            mask2 = cv2.inRange(hsv, lower_dark_red, upper_dark_red)
+            mask = cv2.bitwise_or(mask1, mask2)
+        else:
+            mask = cv2.inRange(hsv, lower_color, upper_color)
+        
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            
+            if is_float:
+                if 75 < area < 400:  
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    solidity = float(area) / (w * h)
+                    if solidity > 0.25 and w < 35 and h < 35:
+                        return (x + w // 2, y + h // 2), (x, y, w, h)
+            else:
+                if 20 < area < 500:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    return (x + w // 2, y + h // 2), (x, y, w, h)
+                
+        return None, None
+
+--- FILE END: vision.py ---
+
+--- FILE START: templates\README.md ---
+# примеры-скриншоты
+--- FILE END: templates\README.md ---
+

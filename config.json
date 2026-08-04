@@ -1,0 +1,55 @@
+{
+    "water_region": {
+        "top": 351,
+        "left": 1107,
+        "width": 382,
+        "height": 263
+    },
+    "bar_region": {
+        "top": 427,
+        "left": 937,
+        "width": 628,
+        "height": 334
+    },
+    "cast_power_time": 0.55,
+    "hsv": {
+        "lower_float": [
+            0,
+            158,
+            160
+        ],
+        "upper_float": [
+            179,
+            255,
+            255
+        ],
+        "lower_zone": [
+            34,
+            127,
+            61
+        ],
+        "upper_zone": [
+            58,
+            247,
+            182
+        ]
+    },
+    "auto_hsv": {
+        "h_tol": 12,
+        "s_tol": 60,
+        "v_tol": 60,
+        "adaptive_float": false,
+        "adaptive_zone": true
+    },
+    "minigame": {
+        "target_pct": 56,
+        "danger_left_pct": 25,
+        "danger_right_pct": 70
+    },
+    "cast_point": {
+        "x": 693,
+        "y": 563,
+        "use_custom": false
+    },
+    "auto_cast_power": true
+}
